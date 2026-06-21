@@ -1,0 +1,23 @@
+# Segredos
+.env
+
+# Caches e dependências
+**/__pycache__/
+**/node_modules/
+**/.venv/
+*.log
+
+# ----------------------------------------------------------------------------
+#  Módulos clonados pelo setup.sh — NÃO versionar dentro da infra.
+#  (Se você optar por GIT SUBMODULES em vez do setup.sh, REMOVA as linhas
+#   abaixo: com submódulos, esses diretórios devem ser rastreados.)
+# ----------------------------------------------------------------------------
+m1-ingestao/
+m2-classificacao/
+m3-priorizacao/
+m4-recorrencia/
+m5-roteamento/
+m6-notificacoes/
+m7-analytics/
+m8-frontend/
+m9-secretarias/

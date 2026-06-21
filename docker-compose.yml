@@ -1,0 +1,415 @@
+# ============================================================================
+#  Projeto Prisma — Tratamento Inteligente de Denúncias (Conecta Recife)
+#  Sistemas Distribuídos — UFRPE
+#
+#  Orquestração completa: RabbitMQ (broker) + 9 módulos + 9 bancos próprios.
+#  Cada módulo é DONO EXCLUSIVO do seu banco (database-per-service):
+#  nenhum container de aplicação acessa o banco de outro módulo.
+#
+#  Comandos principais:
+#    Subir tudo .............. docker compose up --build
+#    Escalar a classificação . docker compose up --build --scale m2-classificacao=3
+#    Derrubar (mantém dados) . docker compose down
+#    Zerar os bancos ......... docker compose down -v
+#    Status .................. docker compose ps
+#    Logs .................... docker compose logs -f
+#
+#  Pré-requisito: cada módulo (m1-ingestao ... m9-secretarias) precisa estar
+#  clonado NESTA pasta e conter um Dockerfile na raiz. Rode ./setup.sh antes.
+#
+#  Todos os serviços compartilham a rede default criada automaticamente pelo
+#  Compose; dentro dela, o nome do serviço resolve como hostname
+#  (ex.: "rabbitmq", "db-m1", "m9-secretarias").
+# ============================================================================
+
+services:
+
+  # ==========================================================================
+  #  INFRAESTRUTURA — Broker de mensageria (NÃO é módulo autoral)
+  #  Desacopla produtores de consumidores. Quem publica não sabe quem consome.
+  # ==========================================================================
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: prisma-rabbitmq
+    hostname: rabbitmq
+    environment:
+      # Usuário dedicado (NÃO "guest") — o guest só conecta via localhost,
+      # e os módulos conectam de outros containers. Ver README › Troubleshooting.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "5672:5672"     # AMQP — conexão dos módulos
+      - "15672:15672"   # Painel web de gestão → http://localhost:15672
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ==========================================================================
+  #  M1 — INGESTÃO DE DENÚNCIAS                    (Laila)
+  #  Produtor de: denuncia.recebida
+  #  Ponto único de entrada. Expõe REST para o cidadão / Conecta Recife.
+  # ==========================================================================
+  db-m1:
+    image: postgres:16-alpine
+    container_name: prisma-db-m1
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ingestao
+    ports:
+      - "5433:5432"     # inspeção opcional (DBeaver/psql) — pode comentar
+    volumes:
+      - db-m1-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ingestao"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  m1-ingestao:
+    build: ./m1-ingestao
+    container_name: prisma-m1
+    environment:
+      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m1:5432/ingestao
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      EXCHANGE: denuncias
+    ports:
+      - "8001:8000"     # API de entrada → http://localhost:8001
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      db-m1:    { condition: service_healthy }
+    restart: unless-stopped
+
+  # ==========================================================================
+  #  M2 — CLASSIFICAÇÃO (NLP)                       (Cauã)
+  #  Consome: denuncia.recebida   →   Produz: denuncia.classificada
+  #
+  #  *** MÓDULO ESCALÁVEL (competing consumers) ***
+  #  Sem container_name e sem ports → o Compose pode subir N réplicas que
+  #  competem pela MESMA fila (m2.classificacao). O RabbitMQ faz round-robin.
+  #      docker compose up --build --scale m2-classificacao=3
+  # ==========================================================================
+  db-m2:
+    image: postgres:16-alpine
+    container_name: prisma-db-m2
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: classificacao
+    ports:
+      - "5434:5432"
+    volumes:
+      - db-m2-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d classificacao"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  m2-classificacao:
+    build: ./m2-classificacao
+    # NÃO definir container_name nem ports → permite réplicas (--scale)
+    environment:
+      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m2:5432/classificacao
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      EXCHANGE: denuncias
+      QUEUE: m2.classificacao
+      BINDING_KEYS: denuncia.recebida
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      db-m2:    { condition: service_healthy }
+    restart: unless-stopped
+
+  # ==========================================================================
+  #  M3 — PRIORIZAÇÃO                               (Cauã)
+  #  Consome: denuncia.classificada, padrao.recorrencia
+  #  Produz:  denuncia.priorizada
+  # ==========================================================================
+  db-m3:
+    image: postgres:16-alpine
+    container_name: prisma-db-m3
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: priorizacao
+    ports:
+      - "5435:5432"
+    volumes:
+      - db-m3-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d priorizacao"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  m3-priorizacao:
+    build: ./m3-priorizacao
+    container_name: prisma-m3
+    environment:
+      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m3:5432/priorizacao
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      EXCHANGE: denuncias
+      QUEUE: m3.priorizacao
+      BINDING_KEYS: denuncia.classificada,padrao.recorrencia
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      db-m3:    { condition: service_healthy }
+    restart: unless-stopped
+
+  # ==========================================================================
+  #  M4 — RECORRÊNCIA TERRITORIAL                   (Tenório)
+  #  Consome: denuncia.classificada   →   Produz: padrao.recorrencia
+  #  Banco: PostGIS (dados georreferenciados). M4 deve rodar, na subida,
+  #  CREATE EXTENSION IF NOT EXISTS postgis; no seu próprio schema.
+  # ==========================================================================
+  db-m4:
+    image: postgis/postgis:16-3.4
+    container_name: prisma-db-m4
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: recorrencia
+    ports:
+      - "5436:5432"
+    volumes:
+      - db-m4-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d recorrencia"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  m4-recorrencia:
+    build: ./m4-recorrencia
+    container_name: prisma-m4
+    environment:
+      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m4:5432/recorrencia
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      EXCHANGE: denuncias
+      QUEUE: m4.recorrencia
+      BINDING_KEYS: denuncia.classificada
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      db-m4:    { condition: service_healthy }
+    restart: unless-stopped
+
+  # ==========================================================================
+  #  M5 — ROTEAMENTO E ENCAMINHAMENTO              (Laila)
+  #  Consome: denuncia.priorizada    →   Produz: denuncia.encaminhada
+  #  Consulta o M9 (secretarias) via REST para descobrir o órgão destino.
+  # ==========================================================================
+  db-m5:
+    image: postgres:16-alpine
+    container_name: prisma-db-m5
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: roteamento
+    ports:
+      - "5437:5432"
+    volumes:
+      - db-m5-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d roteamento"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  m5-roteamento:
+    build: ./m5-roteamento
+    container_name: prisma-m5
+    environment:
+      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m5:5432/roteamento
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      EXCHANGE: denuncias
+      QUEUE: m5.roteamento
+      BINDING_KEYS: denuncia.priorizada
+      # Endereço interno da API do M9 (resolve pela rede do Compose)
+      SECRETARIAS_API_URL: http://m9-secretarias:8000
+    depends_on:
+      rabbitmq:       { condition: service_healthy }
+      db-m5:          { condition: service_healthy }
+      m9-secretarias: { condition: service_started }
+    restart: unless-stopped
+
+  # ==========================================================================
+  #  M6 — NOTIFICAÇÕES                              (Samara)
+  #  Consome: denuncia.encaminhada, denuncia.priorizada (nível crítico)
+  #  Fecha o ciclo com o cidadão e alerta as secretarias (canais do M9).
+  # ==========================================================================
+  db-m6:
+    image: postgres:16-alpine
+    container_name: prisma-db-m6
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: notificacoes
+    ports:
+      - "5438:5432"
+    volumes:
+      - db-m6-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d notificacoes"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  m6-notificacoes:
+    build: ./m6-notificacoes
+    container_name: prisma-m6
+    environment:
+      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m6:5432/notificacoes
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      EXCHANGE: denuncias
+      QUEUE: m6.notificacoes
+      BINDING_KEYS: denuncia.encaminhada,denuncia.priorizada
+      SECRETARIAS_API_URL: http://m9-secretarias:8000
+    depends_on:
+      rabbitmq:       { condition: service_healthy }
+      db-m6:          { condition: service_healthy }
+      m9-secretarias: { condition: service_started }
+    restart: unless-stopped
+
+  # ==========================================================================
+  #  M7 — ANALYTICS E INTELIGÊNCIA URBANA (CQRS)    (Tenório)
+  #  Consome: TODOS os eventos (binding "#") → view consolidada de leitura.
+  #  Banco: MongoDB (view desnormalizada para relatórios). Expõe API ao M8.
+  # ==========================================================================
+  db-m7:
+    image: mongo:7
+    container_name: prisma-db-m7
+    # Sem autenticação no ambiente de desenvolvimento (simplifica a demo).
+    ports:
+      - "27017:27017"   # inspeção opcional (MongoDB Compass) — pode comentar
+    volumes:
+      - db-m7-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  m7-analytics:
+    build: ./m7-analytics
+    container_name: prisma-m7
+    environment:
+      MONGODB_URL: mongodb://db-m7:27017/analytics
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      EXCHANGE: denuncias
+      QUEUE: m7.analytics
+      BINDING_KEYS: "#"   # CQRS: escuta TODOS os eventos do exchange
+    ports:
+      - "8007:8000"     # API de leitura (consumida pelo M8) → http://localhost:8007
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      db-m7:    { condition: service_healthy }
+    restart: unless-stopped
+
+  # ==========================================================================
+  #  M8 — INTERFACE WEB (módulo obrigatório)        (Samara)
+  #  Painel da gestão: mapa de denúncias, filas por prioridade, indicadores.
+  #  Banco: Redis (sessões e cache de telas). Lê os demais módulos via API.
+  #
+  #  ATENÇÃO (rede browser × container): o JavaScript do front roda no
+  #  NAVEGADOR, não dentro do container. Logo, as URLs de API que o front
+  #  chama precisam ser as PORTAS PUBLICADAS NO HOST (localhost:800x),
+  #  e não os hostnames internos do Docker (m7-analytics:8000 NÃO resolve
+  #  no navegador). Se o framework for Vite/CRA, essas variáveis costumam
+  #  ser de BUILD (prefixo VITE_ / REACT_APP_) — passe como build args no
+  #  Dockerfile do M8 se necessário.
+  # ==========================================================================
+  db-m8:
+    image: redis:7-alpine
+    container_name: prisma-db-m8
+    ports:
+      - "6379:6379"     # inspeção opcional — pode comentar
+    volumes:
+      - db-m8-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  m8-frontend:
+    build: ./m8-frontend
+    container_name: prisma-m8
+    environment:
+      REDIS_URL: redis://db-m8:6379/0
+      # URLs de API (host-published, pois quem chama é o navegador):
+      VITE_API_INGESTAO: http://localhost:8001
+      VITE_API_ANALYTICS: http://localhost:8007
+      VITE_API_SECRETARIAS: http://localhost:8009
+    ports:
+      - "8080:80"       # Painel da gestão → http://localhost:8080
+                        # Se o M8 servir num dev server (Vite=5173, CRA=3000),
+                        # troque o lado direito: "8080:5173" ou "8080:3000".
+    depends_on:
+      db-m8:        { condition: service_healthy }
+      m7-analytics: { condition: service_started }
+    restart: unless-stopped
+
+  # ==========================================================================
+  #  M9 — CRUD DE SECRETARIAS                       (Samara / Gestor)
+  #  Cadastro dos órgãos destino do roteamento. SEM mensageria: opera por
+  #  chamadas REST. Expõe sua API para o M5 (roteamento) e M6 (notificações).
+  #  Desativação é soft delete (preserva histórico).
+  # ==========================================================================
+  db-m9:
+    image: postgres:16-alpine
+    container_name: prisma-db-m9
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: secretarias
+    ports:
+      - "5439:5432"
+    volumes:
+      - db-m9-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d secretarias"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  m9-secretarias:
+    build: ./m9-secretarias
+    container_name: prisma-m9
+    environment:
+      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m9:5432/secretarias
+      # M9 não usa RabbitMQ — só banco próprio + API REST.
+    ports:
+      - "8009:8000"     # API de secretarias → http://localhost:8009
+    depends_on:
+      db-m9: { condition: service_healthy }
+    restart: unless-stopped
+
+# ============================================================================
+#  VOLUMES — um por banco. Garante database-per-service também na persistência:
+#  cada banco tem seu próprio volume isolado.
+# ============================================================================
+volumes:
+  rabbitmq-data:
+  db-m1-data:
+  db-m2-data:
+  db-m3-data:
+  db-m4-data:
+  db-m5-data:
+  db-m6-data:
+  db-m7-data:
+  db-m8-data:
+  db-m9-data:
