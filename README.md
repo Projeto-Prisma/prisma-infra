@@ -12,7 +12,6 @@ A lógica de cada módulo vive no seu próprio repositório (`prisma-m1-ingestao
 
 - **Docker** + **Docker Compose v2** (`docker compose`, sem hífen). Verifique com `docker compose version`.
 - **Git**.
-- Acesso ao repositório **privado** `prisma-m9-secretarias` (chave SSH no GitHub recomendada).
 
 ---
 
