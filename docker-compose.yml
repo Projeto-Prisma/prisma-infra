@@ -25,7 +25,7 @@
 services:
 
   # ==========================================================================
-  #  INFRAESTRUTURA — Broker de mensageria (NÃO é módulo autoral)
+  #  INFRAESTRUTURA — Broker de mensageria 
   #  Desacopla produtores de consumidores. Quem publica não sabe quem consome.
   # ==========================================================================
   rabbitmq:
@@ -76,8 +76,13 @@ services:
     build: ./m1-ingestao
     container_name: prisma-m1
     environment:
-      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m1:5432/ingestao
-      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      DATABASE_URL: jdbc:postgresql://db-m1:5432/ingestao
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
       EXCHANGE: denuncias
     ports:
       - "8001:8000"     # API de entrada → http://localhost:8001
@@ -117,11 +122,13 @@ services:
     build: ./m2-classificacao
     # NÃO definir container_name nem ports → permite réplicas (--scale)
     environment:
-      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m2:5432/classificacao
-      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-      EXCHANGE: denuncias
-      QUEUE: m2.classificacao
-      BINDING_KEYS: denuncia.recebida
+      M2_DATABASE_URL: postgresql+asyncpg://${PG_USER}:${PG_PASSWORD}@db-m2:5432/classificacao
+      M2_RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      M2_EXCHANGE: denuncias
+      M2_FILA_IN: m2.denuncia.recebida
+      M2_ROUTING_IN: denuncia.recebida
+    volumes:
+      - hf-cache:/cache/huggingface   # persiste o modelo entre reinícios
     depends_on:
       rabbitmq: { condition: service_healthy }
       db-m2:    { condition: service_healthy }
@@ -413,3 +420,4 @@ volumes:
   db-m7-data:
   db-m8-data:
   db-m9-data:
+  hf-cache:
