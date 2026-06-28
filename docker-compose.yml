@@ -120,7 +120,11 @@ services:
 
   m2-classificacao:
     build: ./m2-classificacao
-    # NÃO definir container_name nem ports → permite réplicas (--scale)
+    # ATENÇÃO: com ports definido, --scale m2-classificacao=N falha (conflito de porta).
+    # Para o demo de escalabilidade (seção 8 do README, passo 5), comente a linha ports:
+    # abaixo antes de rodar: docker compose up --build --scale m2-classificacao=3
+    ports:
+      - "8002:8000"     # API de observabilidade M2 → http://localhost:8002
     environment:
       M2_DATABASE_URL: postgresql+asyncpg://${PG_USER}:${PG_PASSWORD}@db-m2:5432/classificacao
       M2_RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
@@ -161,11 +165,15 @@ services:
     build: ./m3-priorizacao
     container_name: prisma-m3
     environment:
-      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m3:5432/priorizacao
-      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-      EXCHANGE: denuncias
-      QUEUE: m3.priorizacao
-      BINDING_KEYS: denuncia.classificada,padrao.recorrencia
+      M3_DATABASE_URL: postgresql+asyncpg://${PG_USER}:${PG_PASSWORD}@db-m3:5432/priorizacao
+      M3_RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      M3_EXCHANGE: denuncias
+      M3_FILA: m3.priorizacao
+      M3_ROUTING_CLASSIFICADA: denuncia.classificada
+      M3_ROUTING_RECORRENCIA: padrao.recorrencia
+      M3_ROUTING_OUT: denuncia.priorizada
+    ports:
+      - "8003:8000"     # API de observabilidade M3 → http://localhost:8003
     depends_on:
       rabbitmq: { condition: service_healthy }
       db-m3:    { condition: service_healthy }
@@ -199,11 +207,14 @@ services:
     build: ./m4-recorrencia
     container_name: prisma-m4
     environment:
-      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m4:5432/recorrencia
-      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-      EXCHANGE: denuncias
-      QUEUE: m4.recorrencia
-      BINDING_KEYS: denuncia.classificada
+      M4_DATABASE_URL: postgresql+asyncpg://${PG_USER}:${PG_PASSWORD}@db-m4:5432/recorrencia
+      M4_RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      M4_EXCHANGE: denuncias
+      M4_FILA: m4.recorrencia
+      M4_ROUTING_IN: denuncia.classificada
+      M4_ROUTING_OUT: padrao.recorrencia
+    ports:
+      - "8004:8000"     # API de observabilidade M4 → http://localhost:8004
     depends_on:
       rabbitmq: { condition: service_healthy }
       db-m4:    { condition: service_healthy }
@@ -236,13 +247,18 @@ services:
     build: ./m5-roteamento
     container_name: prisma-m5
     environment:
-      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m5:5432/roteamento
-      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-      EXCHANGE: denuncias
-      QUEUE: m5.roteamento
-      BINDING_KEYS: denuncia.priorizada
+      # Spring Boot lê estas variáveis via application.properties (${VAR:default})
+      DATABASE_URL: jdbc:postgresql://db-m5:5432/roteamento
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
       # Endereço interno da API do M9 (resolve pela rede do Compose)
       SECRETARIAS_API_URL: http://m9-secretarias:8000
+    ports:
+      - "8005:8000"     # API de observabilidade M5 → http://localhost:8005
     depends_on:
       rabbitmq:       { condition: service_healthy }
       db-m5:          { condition: service_healthy }
@@ -276,12 +292,14 @@ services:
     build: ./m6-notificacoes
     container_name: prisma-m6
     environment:
-      DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m6:5432/notificacoes
-      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-      EXCHANGE: denuncias
-      QUEUE: m6.notificacoes
-      BINDING_KEYS: denuncia.encaminhada,denuncia.priorizada
-      SECRETARIAS_API_URL: http://m9-secretarias:8000
+      M6_DATABASE_URL: postgresql+asyncpg://${PG_USER}:${PG_PASSWORD}@db-m6:5432/notificacoes
+      M6_RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      M6_EXCHANGE: denuncias
+      M6_FILA: m6.notificacoes
+      M6_SECRETARIAS_API_URL: http://m9-secretarias:8000
+      # bindings hardcoded: denuncia.encaminhada + denuncia.priorizada
+    ports:
+      - "8006:8000"
     depends_on:
       rabbitmq:       { condition: service_healthy }
       db-m6:          { condition: service_healthy }
@@ -312,11 +330,12 @@ services:
     build: ./m7-analytics
     container_name: prisma-m7
     environment:
-      MONGODB_URL: mongodb://db-m7:27017/analytics
-      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-      EXCHANGE: denuncias
-      QUEUE: m7.analytics
-      BINDING_KEYS: "#"   # CQRS: escuta TODOS os eventos do exchange
+      M7_MONGODB_URL: mongodb://db-m7:27017
+      M7_MONGODB_DB: analytics
+      M7_RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      M7_EXCHANGE: denuncias
+      M7_FILA: m7.analytics
+      # binding "#" está hardcoded no messaging.py — escuta TODOS os eventos
     ports:
       - "8007:8000"     # API de leitura (consumida pelo M8) → http://localhost:8007
     depends_on:
@@ -357,9 +376,10 @@ services:
     environment:
       REDIS_URL: redis://db-m8:6379/0
       # URLs de API (host-published, pois quem chama é o navegador):
-      VITE_API_INGESTAO: http://localhost:8001
+      VITE_M1_URL: http://localhost:8001
+      VITE_M2_URL: http://localhost:8002
       VITE_API_ANALYTICS: http://localhost:8007
-      VITE_API_SECRETARIAS: http://localhost:8009
+      VITE_M9_URL: http://localhost:8009
     ports:
       - "8080:80"       # Painel da gestão → http://localhost:8080
                         # Se o M8 servir num dev server (Vite=5173, CRA=3000),
@@ -398,7 +418,7 @@ services:
     container_name: prisma-m9
     environment:
       DATABASE_URL: postgresql://${PG_USER}:${PG_PASSWORD}@db-m9:5432/secretarias
-      # M9 não usa RabbitMQ — só banco próprio + API REST.
+      PORT: 8000        # força uvicorn a escutar em 8000 (M5 e M6 chamam :8000)
     ports:
       - "8009:8000"     # API de secretarias → http://localhost:8009
     depends_on:
