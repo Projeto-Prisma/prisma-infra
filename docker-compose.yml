@@ -371,15 +371,21 @@ services:
     restart: unless-stopped
 
   m8-frontend:
-    build: ./m8-frontend
+    build:
+      context: ./m8-frontend
+      # VITE_ vars são injetadas em BUILD TIME (baked into bundle pelo Vite)
+      args:
+        VITE_M1_URL: http://localhost:8001
+        VITE_M2_URL: http://localhost:8002
+        VITE_M3_URL: http://localhost:8003
+        VITE_M4_URL: http://localhost:8004
+        VITE_M5_URL: http://localhost:8005
+        VITE_M6_URL: http://localhost:8006
+        VITE_API_ANALYTICS: http://localhost:8007
+        VITE_M9_URL: http://localhost:8009
     container_name: prisma-m8
     environment:
       REDIS_URL: redis://db-m8:6379/0
-      # URLs de API (host-published, pois quem chama é o navegador):
-      VITE_M1_URL: http://localhost:8001
-      VITE_M2_URL: http://localhost:8002
-      VITE_API_ANALYTICS: http://localhost:8007
-      VITE_M9_URL: http://localhost:8009
     ports:
       - "8080:80"       # Painel da gestão → http://localhost:8080
                         # Se o M8 servir num dev server (Vite=5173, CRA=3000),
